@@ -12,10 +12,10 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { Label } from "@/components/ui/label"
 import { toast } from "sonner"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-// We might not need useTheme here if the page is simple, but keeping for consistency if dark mode is used.
+
 import { useTheme } from "next-themes"
 
-export default function StartJourneyPage() {
+export default function StartJourneyPage(){ 
   const [formData, setFormData] = useState({
     name: "",
     email: "",
@@ -26,16 +26,22 @@ export default function StartJourneyPage() {
   })
 
   const [isSubmitting, setIsSubmitting] = useState(false)
-  // const { theme, setTheme } = useTheme() // Only if theme toggle is on this page
-  // const [mounted, setMounted] = useState(false) // Only if theme toggle is on this page
+  const [mounted, setMounted] = useState(false)
 
-  // useEffect(() => {
-  //   setMounted(true)
-  // }, [])
+  useEffect(() => {
+    setMounted(true)
+  }, [])
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     const { name, value } = e.target
-    setFormData((prev) => ({ ...prev, [name]: value }))
+    if (name === 'deadline') {
+      // Convert YYYY-MM-DD to DD/MM/YYYY
+      const [year, month, day] = value.split('-')
+      const formattedDate = `${day}/${month}/${year}`
+      setFormData((prev) => ({ ...prev, [name]: formattedDate }))
+    } else {
+      setFormData((prev) => ({ ...prev, [name]: value }))
+    }
   }
 
   const handleFrequencyChange = (value: string) => {
@@ -50,19 +56,85 @@ export default function StartJourneyPage() {
     e.preventDefault()
     setIsSubmitting(true)
 
+    // Validate required fields
+    if (!formData.name || !formData.email || !formData.goal || !formData.deadline) {
+      toast.error("Missing required fields", {
+        description: "Please fill in all required fields.",
+      })
+      setIsSubmitting(false)
+      return
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(formData.email)) {
+      toast.error("Invalid email", {
+        description: "Please enter a valid email address.",
+      })
+      setIsSubmitting(false)
+      return
+    }
+
+    // Validate deadline format (DD/MM/YYYY)
+    const dateRegex = /^(0[1-9]|[12][0-9]|3[01])\/(0[1-9]|1[0-2])\/\d{4}$/
+    if (!dateRegex.test(formData.deadline)) {
+      toast.error("Invalid date format", {
+        description: "Please use DD/MM/YYYY format for the deadline.",
+      })
+      setIsSubmitting(false)
+      return
+    }
+
+    // Validate that the deadline is in the future
+    const [day, month, year] = formData.deadline.split('/').map(Number)
+    const deadlineDate = new Date(year, month - 1, day) // month is 0-indexed in JS
+    const today = new Date()
+    today.setHours(0, 0, 0, 0) // Reset time to start of day for accurate date comparison
+
+    if (deadlineDate <= today) {
+      toast.error("Invalid deadline", {
+        description: "Please select a future date for your deadline.",
+      })
+      setIsSubmitting(false)
+      return
+    }
+
     try {
-      await fetch("/api/submit-goal", {
+      console.log("Submitting form data:", formData);
+      
+      const response = await fetch("/api/submit-data", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify(formData),
-      })
+      });
 
-      toast("Goal submitted!", {
+      console.log("Response status:", response.status);
+      
+      // Try to read the response text first to debug
+      const responseText = await response.text();
+      console.log("Response text:", responseText);
+      
+      // Then try to parse it as JSON if possible
+      let data;
+      try {
+        data = JSON.parse(responseText);
+        console.log("Parsed response data:", data);
+      } catch (parseError) {
+        console.error("Failed to parse response as JSON:", parseError);
+        throw new Error(`Server returned invalid JSON: ${responseText.substring(0, 100)}...`);
+      }
+
+      if (!response.ok) {
+        throw new Error(data?.error || 'Failed to submit goal');
+      }
+
+      toast.success("Goal submitted!", {
         description: "You'll start receiving motivational emails soon.",
-      })
+      });
 
+      // Reset form
       setFormData({
         name: "",
         email: "",
@@ -71,9 +143,11 @@ export default function StartJourneyPage() {
         frequency: "daily",
         tone: "elon",
       })
-    } catch (error) {
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : "Please try again later."
+      console.error("Submission error:", error)
       toast.error("Something went wrong", {
-        description: "Please try again later.",
+        description: errorMessage,
       })
     } finally {
       setIsSubmitting(false)
@@ -171,16 +245,29 @@ export default function StartJourneyPage() {
                 <Label htmlFor="deadline" className="text-slate-900 dark:text-white text-base">
                   Deadline
                 </Label>
-                <Input
-                  id="deadline"
-                  name="deadline"
-                  type="date"
-                  value={formData.deadline}
-                  onChange={handleChange}
-                  required
-                  className="mt-1"
-                  aria-label="Your deadline"
-                />
+                {mounted ? (
+                  <Input
+                    id="deadline"
+                    name="deadline"
+                    type="date"
+                    value={formData.deadline ? new Date(formData.deadline.split('/').reverse().join('-')).toISOString().split('T')[0] : ''}
+                    onChange={handleChange}
+                    required
+                    className="mt-1"
+                    aria-label="Your deadline"
+                  />
+                ) : (
+                  <Input
+                    id="deadline"
+                    name="deadline"
+                    type="date"
+                    value=""
+                    onChange={handleChange}
+                    required
+                    className="mt-1"
+                    aria-label="Your deadline"
+                  />
+                )}
               </div>
 
               <div>
@@ -238,4 +325,4 @@ export default function StartJourneyPage() {
       </div>
     </main>
   )
-} 
+}
