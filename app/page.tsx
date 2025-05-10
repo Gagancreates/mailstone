@@ -127,14 +127,14 @@ export default function Home() {
               className="text-3xl sm:text-5xl md:text-6xl font-bold tracking-tight text-slate-900 dark:text-white mb-6 bg-clip-text text-transparent bg-gradient-to-r from-slate-900 to-slate-700 dark:from-white dark:to-slate-300"
               variants={fadeIn}
             >
-              Get CEO-Level Reminders to Crush Your Goals
+              Emails directly to Your Inbox from Visionaries to Keep You On Track
             </motion.h1>
 
             <motion.p
               className="text-lg sm:text-xl md:text-2xl text-slate-600 dark:text-slate-300 mb-10 max-w-3xl mx-auto"
               variants={fadeIn}
             >
-              Personalized motivation from Elon Musk, Steve Jobs, and other visionaries delivered straight to your
+              Personalized emails from Elon Musk, Steve Jobs, and other visionaries delivered straight to your
               inbox.
             </motion.p>
 
