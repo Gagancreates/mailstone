@@ -1,1 +1,1 @@
-achieve your goal through emails delivered from your fav CEOs
+achieve your deadlines through emails delivered from your fav CEOs
