@@ -4,6 +4,7 @@ import { Inter } from "next/font/google"
 import "./globals.css"
 import { ThemeProvider } from "@/components/theme-provider"
 import { Toaster } from "sonner"
+import ClientNetworkStatus from "@/components/ClientNetworkStatus"
 
 const inter = Inter({ subsets: ["latin"], display: "swap" })
 
@@ -28,6 +29,7 @@ export default function RootLayout({
         <ThemeProvider attribute="class" defaultTheme="light" enableSystem disableTransitionOnChange>
           {children}
           <Toaster richColors />
+          <ClientNetworkStatus />
         </ThemeProvider>
       </body>
     </html>

@@ -99,59 +99,98 @@ export default function StartJourneyPage(){
       return
     }
 
-    try {
-      console.log("Submitting form data:", formData);
-      
-      const response = await fetch("/api/submit-data", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(formData),
-      });
+    // Maximum number of retry attempts
+    const maxRetries = 3;
+    let retryCount = 0;
+    let success = false;
 
-      console.log("Response status:", response.status);
-      
-      // Try to read the response text first to debug
-      const responseText = await response.text();
-      console.log("Response text:", responseText);
-      
-      // Then try to parse it as JSON if possible
-      let data;
+    while (retryCount < maxRetries && !success) {
       try {
-        data = JSON.parse(responseText);
-        console.log("Parsed response data:", data);
-      } catch (parseError) {
-        console.error("Failed to parse response as JSON:", parseError);
-        throw new Error(`Server returned invalid JSON: ${responseText.substring(0, 100)}...`);
+        if (retryCount > 0) {
+          console.log(`Retry attempt ${retryCount}/${maxRetries}`);
+          toast.info(`Retrying submission (${retryCount}/${maxRetries})...`);
+          // Add exponential backoff delay between retries
+          await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, retryCount - 1)));
+        }
+        
+        console.log("Submitting form data:", formData);
+        
+        const response = await fetch("/api/submit-data", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(formData),
+        });
+
+        console.log("Response status:", response.status);
+        
+        // Try to read the response text first to debug
+        const responseText = await response.text();
+        console.log("Response text:", responseText);
+        
+        // Then try to parse it as JSON if possible
+        let data;
+        try {
+          data = JSON.parse(responseText);
+          console.log("Parsed response data:", data);
+        } catch (parseError) {
+          console.error("Failed to parse response as JSON:", parseError);
+          throw new Error(`Server returned invalid JSON: ${responseText.substring(0, 100)}...`);
+        }
+
+        if (!response.ok) {
+          // Check if it's a connection error
+          if (data?.isConnectionError && retryCount < maxRetries - 1) {
+            retryCount++;
+            // Continue to the next retry attempt
+            continue;
+          }
+          throw new Error(data?.error || 'Failed to submit goal');
+        }
+
+        toast.success("Goal submitted!", {
+          description: "You'll start receiving motivational emails soon.",
+        });
+
+        // Reset form
+        setFormData({
+          name: "",
+          email: "",
+          goal: "",
+          deadline: "",
+          frequency: "daily",
+          tone: "elon",
+        });
+        
+        success = true;
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : "Please try again later.";
+        console.error("Submission error:", error);
+        
+        // Check if the error message indicates a network or Firebase connection issue
+        const errorStr = String(error).toLowerCase();
+        const isConnectionIssue = 
+          errorStr.includes('network') || 
+          errorStr.includes('connection') || 
+          errorStr.includes('unavailable') ||
+          errorStr.includes('firebase') ||
+          errorStr.includes('ehostunreach');
+          
+        if (isConnectionIssue && retryCount < maxRetries - 1) {
+          retryCount++;
+          continue;
+        }
+        
+        // If we've exhausted retries or it's not a connection issue, show the error
+        toast.error(retryCount > 0 ? "Connection failed after retries" : "Something went wrong", {
+          description: errorMessage,
+        });
+        break;
       }
-
-      if (!response.ok) {
-        throw new Error(data?.error || 'Failed to submit goal');
-      }
-
-      toast.success("Goal submitted!", {
-        description: "You'll start receiving motivational emails soon.",
-      });
-
-      // Reset form
-      setFormData({
-        name: "",
-        email: "",
-        goal: "",
-        deadline: "",
-        frequency: "daily",
-        tone: "elon",
-      })
-    } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : "Please try again later."
-      console.error("Submission error:", error)
-      toast.error("Something went wrong", {
-        description: errorMessage,
-      })
-    } finally {
-      setIsSubmitting(false)
     }
+    
+    setIsSubmitting(false);
   }
 
   const fadeIn = {

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/firebase';
-import { collection, addDoc, Timestamp, serverTimestamp } from 'firebase/firestore';
+import { collection, addDoc, Timestamp, serverTimestamp, setDoc, doc } from 'firebase/firestore';
 
 // Define an interface for the expected request body
 interface GoalData {
@@ -10,6 +10,26 @@ interface GoalData {
   deadline: string; // Format: DD/MM/YYYY
   frequency: string;
   tone: string;
+}
+
+// Helper function to attempt a Firestore operation with retries
+async function withRetry<T>(operation: () => Promise<T>, maxRetries = 3, delay = 1000): Promise<T> {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      console.warn(`Attempt ${attempt}/${maxRetries} failed:`, error);
+      lastError = error;
+      if (attempt < maxRetries) {
+        console.log(`Retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        // Exponential backoff
+        delay *= 2;
+      }
+    }
+  }
+  throw lastError;
 }
 
 export async function POST(request: Request) {
@@ -92,8 +112,10 @@ export async function POST(request: Request) {
 
       console.log('Attempting to add document to Firestore with data:', docData);
 
-      // Add the document to Firestore
-      const docRef = await addDoc(collection(db, 'goals'), docData);
+      // Add the document to Firestore with retry logic
+      const docRef = await withRetry(async () => {
+        return await addDoc(collection(db, 'goals'), docData);
+      });
       
       console.log('Document added successfully with ID:', docRef.id);
 
@@ -103,8 +125,26 @@ export async function POST(request: Request) {
       );
     } catch (err) {
       console.error("Error adding document to Firestore:", err);
+      
+      // Check for network or connection related errors
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+      const isConnectionError = errorMessage.includes('UNAVAILABLE') || 
+                               errorMessage.includes('EHOSTUNREACH') ||
+                               errorMessage.includes('connection');
+      
+      if (isConnectionError) {
+        return NextResponse.json(
+          { 
+            error: "Network connection to database unavailable. Please check your internet connection and try again.",
+            details: errorMessage,
+            isConnectionError: true
+          },
+          { status: 503 } // Service Unavailable
+        );
+      }
+      
       return NextResponse.json(
-        { error: "Couldn't add the goal. Firebase error: " + (err instanceof Error ? err.message : 'Unknown error') },
+        { error: "Couldn't add the goal. Firebase error: " + errorMessage },
         { status: 500 }
       );
     }
