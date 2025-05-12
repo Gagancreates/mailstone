@@ -1,265 +1,299 @@
 import { NextResponse } from 'next/server';
+import { db } from '@/lib/firebase';
+import { collection, getDocs, query, where, updateDoc, doc, orderBy, limit } from 'firebase/firestore';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import nodemailer from 'nodemailer';
 
-interface EmailRequestData {
-  name: string;
+// Initialize Google Generative AI
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+
+// Create a queue for handling Gemini API requests
+interface QueueItem {
   email: string;
+  name: string;
   goal: string;
   deadline: string;
   tone: string;
   frequency: string;
+  documentId: string;
 }
 
-// Function to generate email using Gemini API
-async function generateEmailWithGemini(data: EmailRequestData): Promise<string> {
-  const { name, goal, deadline, tone } = data;
-  
-  // Parse the deadline
-  const deadlineDate = new Date(deadline);
-  const today = new Date();
-  
-  // Calculate days remaining
-  const daysRemaining = Math.ceil((deadlineDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
-  
-  // Prepare the prompt for Gemini
-  const timeContext = daysRemaining <= 0 
-    ? "today is the deadline" 
-    : daysRemaining === 1 
-      ? "the deadline is tomorrow" 
-      : `there are ${daysRemaining} days left until the deadline`;
-  
-  const prompt = `
-    Write a motivational email to remind someone about their goal. Here are the details:
-    
-    Name: ${name}
-    Goal: ${goal}
-    Time Context: ${timeContext}
-    
-    Email Style:
-    - Tone: ${tone} (be very ${tone} in your writing style)
-    - Format: Professional email with greeting, body paragraphs, and sign-off
-    - Length: Keep it concise yet motivational (150-200 words)
-    
-    Important Guidelines:
-    - If the tone is "friendly", be encouraging, warm, and conversational
-    - If the tone is "professional", be formal, structured, and business-like
-    - If the tone is "motivational", be energetic, inspiring, and use powerful language
-    - Include specific references to their goal: "${goal}"
-    - Reference the time context: ${timeContext}
-    - Include 1-2 specific actionable tips or encouragement related to achieving the goal
-    - Sign off as "MailGoal Team"
-    - Don't use placeholders like [Name] or [Goal] - the actual values are provided above
-    
-    The output should be HTML formatted with appropriate paragraph tags.
-  `;
-  
-  try {
-    // Call Gemini API
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              {
-                text: prompt
-              }
-            ]
-          }
-        ],
-        generationConfig: {
-          temperature: 0.7,
-          topK: 40,
-          topP: 0.95,
-          maxOutputTokens: 1024,
-        }
-      })
-    });
+let processingQueue = false;
+const emailQueue: QueueItem[] = [];
 
-    if (!response.ok) {
-      throw new Error(`Gemini API error: ${response.statusText}`);
+// Create nodemailer transporter
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASSWORD,
+  },
+});
+
+// Function to determine if a reminder should be sent based on frequency and last sent date
+function shouldSendReminder(lastSent: string | null, frequency: string, nextSend: string | null): boolean {
+  const currentDate = new Date();
+  
+  // If nextSend is set, check if we've reached that date
+  if (nextSend) {
+    const nextSendDate = new Date(nextSend);
+    return currentDate >= nextSendDate;
+  }
+  
+  // If no lastSent, this is the first time sending
+  if (!lastSent) return true;
+
+  const lastSentDate = new Date(lastSent);
+  const diffTime = currentDate.getTime() - lastSentDate.getTime();
+  const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+
+  switch (frequency) {
+    case 'daily':
+      return diffDays >= 1;
+    case 'weekly':
+      return diffDays >= 7;
+    case 'biweekly':
+      return diffDays >= 14;
+    case 'monthly':
+      return diffDays >= 30;
+    default:
+      return false;
+  }
+}
+
+// Function to calculate the next send date based on frequency
+function calculateNextSendDate(frequency: string): Date {
+  const nextDate = new Date();
+  
+  switch (frequency) {
+    case 'daily':
+      nextDate.setDate(nextDate.getDate() + 1);
+      break;
+    case 'weekly':
+      nextDate.setDate(nextDate.getDate() + 7);
+      break;
+    case 'biweekly':
+      nextDate.setDate(nextDate.getDate() + 14);
+      break;
+    case 'monthly':
+      nextDate.setMonth(nextDate.getMonth() + 1);
+      break;
+    default:
+      nextDate.setDate(nextDate.getDate() + 1); // Default to daily
+  }
+  
+  return nextDate;
+}
+
+// Function to format date for display
+function formatDate(dateString: string): string {
+  const date = new Date(dateString);
+  return date.toLocaleDateString('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric'
+  });
+}
+
+// Process the queue with rate limiting
+async function processQueue() {
+  if (processingQueue || emailQueue.length === 0) return;
+  
+  processingQueue = true;
+  console.log(`Starting to process queue with ${emailQueue.length} items`);
+
+  try {
+    while (emailQueue.length > 0) {
+      const item = emailQueue.shift();
+      if (!item) continue;
+
+      await generateAndSendEmail(item);
+      
+      // Wait for 30 seconds between requests to respect the rate limit
+      if (emailQueue.length > 0) {
+        console.log(`Waiting 30 seconds before processing next queue item. Remaining: ${emailQueue.length}`);
+        await new Promise(resolve => setTimeout(resolve, 30000));
+      }
+    }
+  } catch (error) {
+    console.error('Error processing queue:', error);
+  } finally {
+    processingQueue = false;
+    console.log('Queue processing completed');
+  }
+}
+
+// Generate email content using Gemini API and send it
+async function generateAndSendEmail({ email, name, goal, deadline, tone, frequency, documentId }: QueueItem) {
+  try {
+    // Format the deadline for display
+    const formattedDeadline = formatDate(deadline);
+    
+    // Create a prompt for Gemini based on the user's tone preference
+    let promptIntro = '';
+    let persona = '';
+    
+    switch (tone) {
+      case 'Elon Musk':
+        promptIntro = 'Write an email reminder in the style of Elon Musk';
+        persona = 'Use Elon Musk\'s direct, visionary tone with occasional references to innovation, Mars, or the future. Include some of his speech patterns like short, declarative sentences and bold statements.';
+        break;
+      case 'Steve Jobs':
+        promptIntro = 'Write an email reminder in the style of Steve Jobs';
+        persona = 'Use Steve Jobs\' persuasive, perfection-focused tone with mentions of design, elegance, or simplicity. Be precise and include his characteristic "one more thing" approach or references to making a dent in the universe.';
+        break;
+      case 'Sam Altman':
+        promptIntro = 'Write an email reminder in the style of Sam Altman';
+        persona = 'Use Sam Altman\'s thoughtful, analytical tone with references to scaling, growth, or potential. Be optimistic yet practical, and include his balanced approach to ambitious goals.';
+        break;
+      case 'Naval Ravikant':
+        promptIntro = 'Write an email reminder in the style of Naval Ravikant';
+        persona = 'Use Naval Ravikant\'s philosophical, wisdom-oriented tone with references to wealth creation, knowledge, or personal leverage. Include some of his aphoristic style and focus on principles.';
+        break;
+      case 'Your Future Self':
+        promptIntro = 'Write an email reminder as if it\'s from the recipient\'s successful future self';
+        persona = 'Write from the perspective of the recipient after they\'ve accomplished their goals and looking back. Be encouraging, wise, and emphasize the importance of the current actions for future success.';
+        break;
+      default:
+        promptIntro = 'Write a professional email reminder';
+        persona = 'Use a balanced, professional tone suitable for a workplace reminder.';
     }
 
-    const data = await response.json();
+    const prompt = `${promptIntro} to ${name} about completing their goal: "${goal}" by the deadline of ${formattedDeadline}.
+
+${persona}
+
+The email should:
+1. Have a clear subject line
+2. Address the recipient by name
+3. Remind them about their goal in the specified style
+4. Mention the deadline
+5. Encourage them to take action
+6. Include a sign-off that matches the persona
+
+Format the email with proper line breaks and paragraphs, ready to be sent via email (include subject line separate from body).`;
+
+    // Call Gemini API to generate the email
+    const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
+    const result = await model.generateContent(prompt);
+    const emailContent = result.response.text();
     
-    // Extract the text from the response
-    const generatedText = data.candidates[0].content.parts[0].text;
+    console.log('Generated email content:', emailContent);
     
-    // Format HTML properly
-    const formattedHtml = `
-      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-        ${generatedText.replace(/\n\n/g, '</p><p style="font-size: 16px; line-height: 1.6; color: #2d3748;">').replace(/\n/g, '<br>')}
-      </div>
-    `;
+    // Parse the generated content to extract subject and body
+    let subject = 'Reminder: Goal Deadline Approaching';
+    let body = emailContent;
     
-    return formattedHtml;
+    // Try to extract subject line if available
+    // Look for patterns like "Subject:" or "SUBJECT:" at the beginning of a line
+    const subjectMatch = emailContent.match(/^Subject:(.+?)(\n|$)/im) || 
+                        emailContent.match(/^SUBJECT:(.+?)(\n|$)/im);
     
+    if (subjectMatch) {
+      subject = subjectMatch[1].trim();
+      // Remove the subject line from the email body
+      body = emailContent.replace(/^Subject:.+?(\n|$)/im, '').trim();
+      body = body.replace(/^SUBJECT:.+?(\n|$)/im, '').trim();
+    }
+    
+    // If no explicit subject was found, look for the first line that might be a subject
+    if (subject === 'Reminder: Goal Deadline Approaching' && !subjectMatch) {
+      const lines = emailContent.split('\n');
+      if (lines.length > 0 && lines[0].length < 100) {
+        subject = lines[0].trim();
+        body = lines.slice(1).join('\n').trim();
+      }
+    }
+
+    console.log('Parsed email subject:', subject);
+    console.log('Parsed email body length:', body.length);
+
+    // Send the email
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: subject,
+      text: body,
+    };
+
+    await transporter.sendMail(mailOptions);
+    console.log(`Email sent to ${email}`);
+
+    // Calculate the next send date based on frequency
+    const nextSendDate = calculateNextSendDate(frequency);
+
+    // Update the database to record when this reminder was sent and when the next one should be
+    await updateDoc(doc(db, 'goals', documentId), {
+      lastSent: new Date().toISOString(),
+      nextSend: nextSendDate.toISOString(),
+      status: 'sent'
+    });
+    
+    return true;
   } catch (error) {
-    console.error('Error calling Gemini API:', error);
+    console.error(`Failed to generate or send email for ${email}:`, error);
+    return false;
+  }
+}
+
+export async function GET() {
+  try {
+    const currentDate = new Date();
+    console.log('Starting email check process at', currentDate.toISOString());
     
-    // Fall back to template-based email if Gemini fails
-    return generateFallbackEmail(data);
-  }
-}
-
-// Fallback function to generate email when Gemini API fails
-function generateFallbackEmail(data: EmailRequestData): string {
-  const { name, goal, deadline, tone } = data;
-  
-  // Parse the deadline
-  const deadlineDate = new Date(deadline);
-  const today = new Date();
-  
-  // Calculate days remaining
-  const daysRemaining = Math.ceil((deadlineDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
-  
-  // Generate email based on tone and days remaining
-  let greeting, mainContent, motivation, closing;
-  
-  // Greeting based on tone
-  if (tone === 'friendly') {
-    greeting = `Hi ${name}!`;
-  } else if (tone === 'professional') {
-    greeting = `Dear ${name},`;
-  } else if (tone === 'motivational') {
-    greeting = `Hey there, ${name}!`;
-  } else {
-    greeting = `Hello ${name},`;
-  }
-  
-  // Main content based on remaining days
-  if (daysRemaining <= 0) {
-    mainContent = `Today is the deadline for your goal: "${goal}". Have you accomplished what you set out to do?`;
-  } else if (daysRemaining === 1) {
-    mainContent = `Tomorrow is the deadline for your goal: "${goal}". This is your final push!`;
-  } else {
-    mainContent = `You have ${daysRemaining} days left to achieve your goal: "${goal}".`;
-  }
-  
-  // Motivation based on tone
-  if (tone === 'friendly') {
-    motivation = `I believe in you! Keep going, you've got this.`;
-  } else if (tone === 'professional') {
-    motivation = `Consistent progress is key to success. Stay focused on your objectives.`;
-  } else if (tone === 'motivational') {
-    motivation = `Every step you take brings you closer to success. Push your limits and achieve greatness!`;
-  } else {
-    motivation = `Remember why you started. Your future self will thank you for the effort you put in today.`;
-  }
-  
-  // Closing based on tone
-  if (tone === 'friendly') {
-    closing = `Cheering you on,<br>MailGoal Team`;
-  } else if (tone === 'professional') {
-    closing = `Best regards,<br>MailGoal Team`;
-  } else if (tone === 'motivational') {
-    closing = `Go crush it!<br>MailGoal Team`;
-  } else {
-    closing = `Wishing you success,<br>MailGoal Team`;
-  }
-  
-  
-  return`
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-      <h2 style="color: #4a5568;">${greeting}</h2>
-      <p style="font-size: 16px; line-height: 1.6; color: #2d3748;">
-        ${mainContent}
-      </p>
-      <p style="font-size: 16px; line-height: 1.6; color: #2d3748;">
-        ${motivation}
-      </p>
-      <p style="font-style: italic; color: #718096;">
-        ${closing}
-      </p>
-    </div>
-  `;
-}
-
-// Queue system to handle Gemini API rate limiting (2 requests per minute)
-class RequestQueue {
-  private queue: { data: EmailRequestData, resolve: (value: string) => void, reject: (reason?: any) => void }[] = [];
-  private processing = false;
-  private lastRequestTime = 0;
-  
-  async enqueue(data: EmailRequestData): Promise<string> {
-    return new Promise<string>((resolve, reject) => {
-      // Add to queue
-      this.queue.push({ data, resolve, reject });
+    // Get all non-completed goals from Firestore
+    const goalsRef = collection(db, 'goals');
+    const q = query(
+      goalsRef,
+      where('completed', '==', false)
+      // Removed the orderBy to avoid needing a composite index
+    );
+    
+    const querySnapshot = await getDocs(q);
+    console.log(`Found ${querySnapshot.size} incomplete goals`);
+    
+    // Check each goal to see if a reminder needs to be sent
+    querySnapshot.forEach((docSnapshot) => {
+      const data = docSnapshot.data();
       
-      // Process queue if not already processing
-      if (!this.processing) {
-        this.processQueue();
+      // Check if we should send a reminder based on frequency, last sent date, and next send date
+      if (shouldSendReminder(data.lastSent, data.frequency, data.nextSend)) {
+        console.log(`Adding user ${data.email} to email queue`);
+        
+        // Add to the queue
+        emailQueue.push({
+          email: data.email,
+          name: data.name,
+          goal: data.goal,
+          deadline: data.deadline,
+          tone: data.tone,
+          frequency: data.frequency,
+          documentId: docSnapshot.id
+        });
       }
     });
-  }
-  
-  private async processQueue() {
-    if (this.queue.length === 0) {
-      this.processing = false;
-      return;
+    
+    // If the queue has items and isn't already being processed, start processing
+    if (emailQueue.length > 0 && !processingQueue) {
+      // Start processing the queue asynchronously
+      processQueue().catch(err => console.error('Queue processing error:', err));
     }
     
-    this.processing = true;
-    
-    // Get next item
-    const item = this.queue.shift();
-    if (!item) {
-      this.processing = false;
-      return;
-    }
-    
-    try {
-      // Check if we need to wait (rate limit: 2 requests per minute)
-      const now = Date.now();
-      const timeSinceLastRequest = now - this.lastRequestTime;
-      const minWaitTime = 30000; // 30 seconds between requests (2 per minute)
-      
-      if (timeSinceLastRequest < minWaitTime) {
-        const waitTime = minWaitTime - timeSinceLastRequest;
-        console.log(`Rate limiting: waiting ${waitTime}ms before next Gemini API request`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-      }
-      
-      // Process request
-      this.lastRequestTime = Date.now();
-      const result = await generateEmailWithGemini(item.data);
-      item.resolve(result);
-      
-    } catch (error) {
-      console.error('Error processing queue item:', error);
-      // Fall back to template on error
-      const fallbackEmail = generateFallbackEmail(item.data);
-      item.resolve(fallbackEmail);
-    }
-    
-    // Process next item with a small delay
-    setTimeout(() => this.processQueue(), 100);
-  }
-}
-
-// Create singleton queue
-const requestQueue = new RequestQueue();
-
-export async function POST(request: Request) {
-  try {
-    const body = await request.json() as EmailRequestData;
-    
-    console.log('Email generation request received for:', body.name);
-    
-    // Add request to queue and wait for result
-    const html = await requestQueue.enqueue(body);
-    
-    console.log('Email content generated successfully');
-    
-    return NextResponse.json({ html });
-    
+    return NextResponse.json({ 
+      message: `Processing ${emailQueue.length} emails in the queue`,
+      queueLength: emailQueue.length
+    });
   } catch (error) {
-    console.error('Error generating email:', error);
+    console.error('Error in GET handler:', error);
     return NextResponse.json(
-      { error: 'Failed to generate email: ' + (error instanceof Error ? error.message : 'Unknown error') },
+      { error: "Error processing email reminders: " + (error instanceof Error ? error.message : 'Unknown error') },
       { status: 500 }
     );
   }
-} 
+}
+
+// Scheduled function to run this endpoint
+export async function POST() {
+  // This can be called by a cron job or webhook
+  return await GET();
+}

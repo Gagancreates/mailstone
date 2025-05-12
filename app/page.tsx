@@ -266,7 +266,7 @@ export default function Home() {
       <a href="https://twitter.com" target="_blank" rel="noopener noreferrer" aria-label="Twitter">
         <Twitter className="h-6 w-6 text-slate-300 hover:text-white transition-colors" />
       </a>
-      <a href="https://github.com" target="_blank" rel="noopener noreferrer" aria-label="GitHub">
+      <a href="https://github.com/Gagancreates" target="_blank" rel="noopener noreferrer" aria-label="GitHub">
         <Github className="h-6 w-6 text-slate-300 hover:text-white transition-colors" />
       </a>
     </div>
